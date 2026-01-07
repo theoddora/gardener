@@ -63,27 +63,27 @@ Health check implementations can optionally implement one or both of the followi
 
 ```go
 type ShootClient interface {
-    // InjectShootClient injects the shoot client
-    InjectShootClient(client.Client)
+    // InjectTargetClient injects the shoot client
+    InjectTargetClient(client.Client)
 }
 
 type SeedClient interface {
-    // InjectSeedClient injects the seed client
-    InjectSeedClient(client.Client)
+    // InjectSourceClient injects the seed client
+    InjectSourceClient(client.Client)
 }
 ```
 
 The health check controller automatically detects if a health checker implements these interfaces and injects the corresponding clients before executing the health checks.
-This allows health checks to interact with resources in the shoot cluster (via `ShootClient`) or the seed cluster (via `SeedClient`) as needed.
+This allows health checks to interact with resources in the shoot cluster (via `TargetClient`) or the seed cluster (via `SeedClient`) as needed.
 
-For example, a health check that needs to verify resources in the shoot cluster would implement the `ShootClient` interface:
+For example, a health check that needs to verify resources in the shoot cluster would implement the `TargetClient` interface:
 
 ```go
 type MyShootHealthCheck struct {
     shootClient client.Client
 }
 
-func (h *MyShootHealthCheck) InjectShootClient(c client.Client) {
+func (h *MyShootHealthCheck) InjectTargetClient(c client.Client) {
     h.shootClient = c
 }
 

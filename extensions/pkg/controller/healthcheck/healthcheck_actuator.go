@@ -22,31 +22,35 @@ import (
 	extensionscontroller "github.com/gardener/gardener/extensions/pkg/controller"
 	"github.com/gardener/gardener/extensions/pkg/util"
 	gardencorev1beta1 "github.com/gardener/gardener/pkg/apis/core/v1beta1"
+	extensionsv1alpha1 "github.com/gardener/gardener/pkg/apis/extensions/v1alpha1"
+	operatorv1alpha1 "github.com/gardener/gardener/pkg/apis/operator/v1alpha1"
 )
 
 // Actuator contains all the health checks and the means to execute them
 type Actuator struct {
-	restConfig *rest.Config
-	seedClient client.Client
+	restConfig   *rest.Config
+	sourceClient client.Client
 
 	provider            string
 	extensionKind       string
+	extensionClass      extensionsv1alpha1.ExtensionClass
 	getExtensionObjFunc GetExtensionObjectFunc
 	healthChecks        []ConditionTypeToHealthCheck
-	shootRESTOptions    extensionsconfigv1alpha1.RESTOptions
+	targetRESTOptions   extensionsconfigv1alpha1.RESTOptions
 }
 
 // NewActuator creates a new Actuator.
-func NewActuator(mgr manager.Manager, provider, extensionKind string, getExtensionObjFunc GetExtensionObjectFunc, healthChecks []ConditionTypeToHealthCheck, shootRESTOptions extensionsconfigv1alpha1.RESTOptions) HealthCheckActuator {
+func NewActuator(mgr manager.Manager, provider, extensionKind string, getExtensionObjFunc GetExtensionObjectFunc, healthChecks []ConditionTypeToHealthCheck, targetRESTOptions extensionsconfigv1alpha1.RESTOptions, class extensionsv1alpha1.ExtensionClass) HealthCheckActuator {
 	return &Actuator{
-		restConfig: mgr.GetConfig(),
-		seedClient: mgr.GetClient(),
+		restConfig:   mgr.GetConfig(),
+		sourceClient: mgr.GetClient(),
 
 		healthChecks:        healthChecks,
 		getExtensionObjFunc: getExtensionObjFunc,
 		provider:            provider,
 		extensionKind:       extensionKind,
-		shootRESTOptions:    shootRESTOptions,
+		extensionClass:      class,
+		targetRESTOptions:   targetRESTOptions,
 	}
 }
 
@@ -77,18 +81,18 @@ type checkResultForConditionType struct {
 // returns an Result for each HealthConditionType (e.g  ControlPlaneHealthy)
 func (a *Actuator) ExecuteHealthCheckFunctions(ctx context.Context, log logr.Logger, request types.NamespacedName) (*[]Result, error) {
 	var (
-		shootClient client.Client
-		channel     = make(chan channelResult, len(a.healthChecks))
-		wg          sync.WaitGroup
+		targetClient client.Client
+		channel      = make(chan channelResult, len(a.healthChecks))
+		wg           sync.WaitGroup
 	)
 
 	for _, hc := range a.healthChecks {
 		check := hc.HealthCheck
-		SeedClientInto(a.seedClient, check)
-		if _, ok := check.(ShootClient); ok {
-			if shootClient == nil {
+		SourceClientInfo(a.sourceClient, check)
+		if _, ok := check.(SourceClient); ok {
+			if targetClient == nil {
 				var err error
-				_, shootClient, err = util.NewClientForShoot(ctx, a.seedClient, request.Namespace, client.Options{}, a.shootRESTOptions)
+				_, targetClient, err = util.NewClientForShoot(ctx, a.sourceClient, request.Namespace, client.Options{}, a.targetRESTOptions)
 				if err != nil {
 					// don't return here, as we might have started some goroutines already to prevent leakage
 					channel <- channelResult{
@@ -102,7 +106,7 @@ func (a *Actuator) ExecuteHealthCheckFunctions(ctx context.Context, log logr.Log
 					continue
 				}
 			}
-			ShootClientInto(shootClient, check)
+			TargetClientInfo(targetClient, check)
 		}
 
 		check.SetLoggerSuffix(a.provider, a.extensionKind)
@@ -113,7 +117,7 @@ func (a *Actuator) ExecuteHealthCheckFunctions(ctx context.Context, log logr.Log
 
 			if preCheckFunc != nil {
 				obj := a.getExtensionObjFunc()
-				if err := a.seedClient.Get(ctx, request, obj); err != nil {
+				if err := a.sourceClient.Get(ctx, request, obj); err != nil {
 					channel <- channelResult{
 						healthCheckResult: &SingleCheckResult{
 							Status: gardencorev1beta1.ConditionFalse,
@@ -125,12 +129,12 @@ func (a *Actuator) ExecuteHealthCheckFunctions(ctx context.Context, log logr.Log
 					return
 				}
 
-				cluster, err := extensionscontroller.GetCluster(ctx, a.seedClient, request.Namespace)
+				checkObject, err := a.getCheckFuncObject(ctx, request)
 				if err != nil {
 					channel <- channelResult{
 						healthCheckResult: &SingleCheckResult{
 							Status: gardencorev1beta1.ConditionFalse,
-							Detail: fmt.Sprintf("failed to read the cluster resource: %v", err),
+							Detail: fmt.Sprintf("failed to read the resource: %v", err),
 						},
 						error:               err,
 						healthConditionType: healthConditionType,
@@ -138,7 +142,7 @@ func (a *Actuator) ExecuteHealthCheckFunctions(ctx context.Context, log logr.Log
 					return
 				}
 
-				if !preCheckFunc(ctx, a.seedClient, obj, cluster) {
+				if !preCheckFunc(ctx, a.sourceClient, obj, checkObject) {
 					log.V(1).Info("Skipping health check as pre check function returned false", "conditionType", healthConditionType)
 					channel <- channelResult{
 						healthCheckResult: &SingleCheckResult{
@@ -152,6 +156,8 @@ func (a *Actuator) ExecuteHealthCheckFunctions(ctx context.Context, log logr.Log
 			}
 
 			healthCheckResult, err := check.Check(ctx, request)
+			// TODO(theoddora): remove debug print
+			fmt.Println("healthCheckResult:", healthCheckResult, "err:", err)
 
 			if healthCheckResult != nil && errorCodeCheckFunc != nil {
 				healthCheckResult.Codes = append(healthCheckResult.Codes, errorCodeCheckFunc(fmt.Errorf("%s", healthCheckResult.Detail))...)
@@ -260,4 +266,40 @@ func (a *Actuator) ExecuteHealthCheckFunctions(ctx context.Context, log logr.Log
 	}
 
 	return &checkResults, nil
+}
+
+func (a *Actuator) getCheckFuncObject(ctx context.Context, request types.NamespacedName) (any, error) {
+	var checkObject any
+	if a.extensionClass != extensionsv1alpha1.ExtensionClassGarden {
+		cluster, err := extensionscontroller.GetCluster(ctx, a.sourceClient, request.Namespace)
+		if err != nil {
+			return nil, err
+		}
+		checkObject = cluster
+	} else {
+		garden, err := getGarden(ctx, a.sourceClient)
+		if err != nil {
+			return nil, err
+		}
+		checkObject = garden
+	}
+	return checkObject, nil
+}
+
+// getGarden retrieves the Garden resource from the garden cluster.
+func getGarden(ctx context.Context, c client.Client) (*operatorv1alpha1.Garden, error) {
+	gardenList := &operatorv1alpha1.GardenList{}
+	if err := c.List(ctx, gardenList); err != nil {
+		return nil, fmt.Errorf("failed to list Garden resources: %w", err)
+	}
+
+	if len(gardenList.Items) == 0 {
+		return nil, fmt.Errorf("no Garden resource found")
+	}
+
+	if len(gardenList.Items) > 1 {
+		return nil, fmt.Errorf("multiple Garden resources found, expected exactly one")
+	}
+
+	return &gardenList.Items[0], nil
 }

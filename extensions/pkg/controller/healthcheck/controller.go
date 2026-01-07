@@ -22,6 +22,7 @@ import (
 	"github.com/gardener/gardener/pkg/api/extensions"
 	gardencorev1beta1 "github.com/gardener/gardener/pkg/apis/core/v1beta1"
 	extensionsv1alpha1 "github.com/gardener/gardener/pkg/apis/extensions/v1alpha1"
+	operatorv1alpha1 "github.com/gardener/gardener/pkg/apis/operator/v1alpha1"
 	"github.com/gardener/gardener/pkg/controllerutils/mapper"
 	predicateutils "github.com/gardener/gardener/pkg/controllerutils/predicate"
 	"github.com/gardener/gardener/pkg/utils"
@@ -121,7 +122,7 @@ func DefaultRegistration(
 		shootRestOptions = *opts.HealthCheckConfig.ShootRESTOptions
 	}
 
-	healthCheckActuator := NewActuator(mgr, args.Type, args.GetExtensionGroupVersionKind().Kind, getExtensionObjFunc, healthChecks, shootRestOptions)
+	healthCheckActuator := NewActuator(mgr, args.Type, args.GetExtensionGroupVersionKind().Kind, getExtensionObjFunc, healthChecks, shootRestOptions, args.ExtensionClass)
 	return Register(mgr, args, healthCheckActuator)
 }
 
@@ -186,7 +187,7 @@ func add(mgr manager.Manager, args AddArgs, actuator HealthCheckActuator) error 
 
 	log.Log.Info("Registering health check controller", "kind", args.registeredExtension.groupVersionKind.Kind, "type", args.Type, "conditionTypes", args.registeredExtension.healthConditionTypes, "syncPeriod", args.SyncPeriod.Duration.String())
 
-	return builder.
+	builder := builder.
 		ControllerManagedBy(mgr).
 		Named(controllerName).
 		WithOptions(args.ControllerOptions).
@@ -194,14 +195,23 @@ func add(mgr manager.Manager, args AddArgs, actuator HealthCheckActuator) error 
 			args.registeredExtension.getExtensionObjFunc(),
 			&handler.EnqueueRequestForObject{},
 			builder.WithPredicates(predicates...),
-		).
-		// watch Cluster of Shoot provider type (e.g. aws)
-		// this is to be notified when the Shoot is being hibernated (stop health checks) and wakes up (start health checks again)
-		Watches(
-			&extensionsv1alpha1.Cluster{},
-			handler.EnqueueRequestsFromMapFunc(mapper.ClusterToObjectMapper(mgr.GetClient(), args.GetExtensionObjListFunc, predicates)),
-		).
-		Complete(NewReconciler(mgr, actuator, *args.registeredExtension, args.SyncPeriod))
+		)
+
+	switch args.ExtensionClass {
+	case extensionsv1alpha1.ExtensionClassGarden:
+		return builder.
+			Watches(&operatorv1alpha1.Garden{}, handler.EnqueueRequestsFromMapFunc(mapper.GardenToObjectMapper(mgr.GetClient(), args.GetExtensionObjListFunc, predicates))).
+			Complete(NewReconciler(mgr, actuator, *args.registeredExtension, args.SyncPeriod, args.ExtensionClass))
+	default:
+		return builder.
+			// watch Cluster of Shoot provider type (e.g. aws)
+			// this is to be notified when the Shoot is being hibernated (stop health checks) and wakes up (start health checks again)
+			Watches(
+				&extensionsv1alpha1.Cluster{},
+				handler.EnqueueRequestsFromMapFunc(mapper.ClusterToObjectMapper(mgr.GetClient(), args.GetExtensionObjListFunc, predicates)),
+			).
+			Complete(NewReconciler(mgr, actuator, *args.registeredExtension, args.SyncPeriod, args.ExtensionClass))
+	}
 }
 
 func getHealthCheckTypes(healthChecks []ConditionTypeToHealthCheck) []string {

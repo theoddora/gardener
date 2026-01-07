@@ -18,6 +18,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	extensionsv1alpha1 "github.com/gardener/gardener/pkg/apis/extensions/v1alpha1"
+	operatorv1alpha1 "github.com/gardener/gardener/pkg/apis/operator/v1alpha1"
 	predicateutils "github.com/gardener/gardener/pkg/controllerutils/predicate"
 )
 
@@ -32,6 +33,26 @@ func ClusterToObjectMapper(reader client.Reader, newObjListFunc func() client.Ob
 
 		objList := newObjListFunc()
 		if err := reader.List(ctx, objList, client.InNamespace(cluster.Name)); err != nil {
+			return nil
+		}
+
+		return ObjectListToRequests(objList, func(o client.Object) bool {
+			return predicateutils.EvalGeneric(o, predicates...)
+		})
+	}
+}
+
+// GardenToObjectMapper returns a mapper that returns requests for objects whose referenced garden have been
+// modified.
+func GardenToObjectMapper(reader client.Reader, newObjListFunc func() client.ObjectList, predicates []predicate.Predicate) handler.MapFunc {
+	return func(ctx context.Context, obj client.Object) []reconcile.Request {
+		garden, ok := obj.(*operatorv1alpha1.Garden)
+		if !ok {
+			return nil
+		}
+
+		objList := newObjListFunc()
+		if err := reader.List(ctx, objList, client.InNamespace(garden.Name)); err != nil {
 			return nil
 		}
 
